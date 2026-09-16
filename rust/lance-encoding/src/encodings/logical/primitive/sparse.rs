@@ -2645,7 +2645,7 @@ impl SparseStructuralScheduler {
     ) -> Result<Vec<u64>> {
         Self::validate_structural_buffer_headers(encoding, &data, label)?;
         let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decompressor.decompress(LanceBuffer::from_bytes(data, 1), num_values)
+            decompressor.decompress(Some(LanceBuffer::from_bytes(data, 1)), num_values)
         }))
         .map_err(|_| {
             Error::invalid_input_source(
@@ -3990,7 +3990,7 @@ impl DecodeSparseStructuralTask {
             data_builder.append(
                 values,
                 value_start - chunk_value_start..take_end - chunk_value_start,
-            );
+            )?;
             value_start = take_end;
         }
         Ok(())

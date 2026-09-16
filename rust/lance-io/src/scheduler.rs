@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
+use futures::future::Either;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
@@ -378,7 +379,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     priority: u128,
     num_reqs: usize,
     num_delivered: usize,
-    err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    err: Option<Error>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
     // Queue the batch's backpressure reservation is refunded to once its response
@@ -417,7 +418,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
         // If we have an error, return that. Otherwise return the data, as long as the I/O requests have been processed.
         let result = if let Some(err) = self.err.take() {
-            Err(Error::wrapped(err))
+            Err(err)
         } else if self.num_delivered < self.data_buffers.len() {
             // This usually happens on tokio runtime shutdown
             Err(Error::io(format!(
@@ -469,7 +470,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
             }
             Err(err) => {
                 // This keeps the original error, if present
-                self.err.get_or_insert(Box::new(err));
+                self.err.get_or_insert(err);
             }
         }
     }
@@ -481,6 +482,23 @@ struct IoTask {
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
     priority: u128,
     bypass_backpressure: bool,
+}
+
+fn validate_read_length(
+    file_path: &Path,
+    requested_range: &Range<u64>,
+    bytes: Bytes,
+) -> Result<Bytes> {
+    let expected_len = requested_range.end - requested_range.start;
+    if bytes.len() as u64 != expected_len {
+        return Err(Error::io(format!(
+            "I/O request for file {file_path} and range {}..{} returned {} bytes, expected {expected_len} bytes",
+            requested_range.start,
+            requested_range.end,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 impl Eq for IoTask {}
@@ -534,6 +552,7 @@ impl IoTask {
                 })
                 .await
                 .map_err(Error::from)
+                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
         };
         // Emit per-file I/O trace event only when tracing is enabled
         tracing::trace!(
@@ -1056,11 +1075,15 @@ impl ScanScheduler {
             .map(|task| {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
+                let requested_range = task.clone();
                 let run_fn = Box::new(move || {
-                    reader
-                        .get_range(task.start as usize..task.end as usize)
-                        .map_err(Error::from)
-                        .boxed()
+                    let bytes_fut = reader
+                        .get_range(requested_range.start as usize..requested_range.end as usize);
+                    async move {
+                        let bytes = bytes_fut.await.map_err(Error::from)?;
+                        validate_read_length(reader.path(), &requested_range, bytes)
+                    }
+                    .boxed()
                 });
                 queue.submit(task, priority, run_fn, bypass_backpressure)
             })
@@ -1168,6 +1191,8 @@ impl FileScheduler {
     /// Each request has a backpressure ID which controls which backpressure throttle
     /// is applied to the request.  Requests made to the same backpressure throttle
     /// will be throttled together.
+    ///
+    /// Ranges must be sorted by their start offset.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
@@ -1175,6 +1200,19 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
+
+        if let Some((range_index, ranges)) = request
+            .windows(2)
+            .enumerate()
+            .find(|(_, ranges)| ranges[0].start > ranges[1].start)
+        {
+            return Either::Left(std::future::ready(Err(Error::invalid_input(format!(
+                "I/O request ranges must be sorted by start offset: range at index {range_index} is {:?}, but range at index {} is {:?}",
+                ranges[0],
+                range_index + 1,
+                ranges[1]
+            )))));
+        }
 
         let mut merged_requests = Vec::with_capacity(request.len());
 
@@ -1228,7 +1266,7 @@ impl FileScheduler {
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
-        async move {
+        Either::Right(async move {
             let bytes_vec = bytes_vec_fut.await?;
 
             let mut orig_index = 0;
@@ -1271,7 +1309,7 @@ impl FileScheduler {
             }
 
             Ok(final_bytes)
-        }
+        })
     }
 
     pub fn with_priority(&self, priority: u64) -> Self {
@@ -1345,6 +1383,7 @@ mod tests {
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
+    use rstest::rstest;
 
     use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
@@ -1523,6 +1562,75 @@ mod tests {
         assert_eq!(bytes[0], some_data);
     }
 
+    #[derive(Debug)]
+    struct ShortReader {
+        path: Path,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for ShortReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for ShortReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn get_range(
+            &self,
+            _range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_short_read_returns_io_error(#[case] use_lite_scheduler: bool) {
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::memory()), config);
+        let reader = Arc::new(ShortReader {
+            path: Path::parse("short-file").unwrap(),
+        });
+        let file_scheduler = scheduler.open_reader(reader);
+
+        let error = file_scheduler
+            .submit_request(vec![0..8], 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request for file short-file and range 0..8 returned 0 bytes, expected 8 bytes"
+            ),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_split_coalesce() {
         let tmp_file = TempObjFile::default();
@@ -1605,6 +1713,38 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_unordered_ranges_are_rejected(#[case] use_lite_scheduler: bool) {
+        let path = Path::parse("unordered-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(object_store, config);
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let ranges = vec![9..26, 0..49];
+        let error = file_scheduler.submit_request(ranges, 0).await.unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request ranges must be sorted by start offset: range at index 0 is 9..26, but range at index 1 is 0..49"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]

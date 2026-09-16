@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, '$.name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -274,6 +274,10 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    /// Whether IS NULL queries need post-filter rechecking. May be false even
+    /// when `needs_recheck` is true for indexes that track exact null positions
+    /// (e.g. zone maps with a null bitmap).
+    is_null_needs_recheck: bool,
     supports_like_prefix: bool,
 }
 
@@ -283,6 +287,7 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            is_null_needs_recheck: needs_recheck,
             supports_like_prefix: true,
         }
     }
@@ -292,6 +297,14 @@ impl SargableQueryParser {
     /// ordinary filtering instead of failing at search time.
     pub fn without_like_prefix(mut self) -> Self {
         self.supports_like_prefix = false;
+        self
+    }
+
+    /// Mark IS NULL as exact so that IS NOT NULL can be served by the index
+    /// without a post-filter. Use this when the index tracks null row addresses
+    /// precisely (e.g. a zone map with a null bitmap).
+    pub fn with_exact_null_tracking(mut self) -> Self {
+        self.is_null_needs_recheck = false;
         self
     }
 }
@@ -362,7 +375,7 @@ impl ScalarQueryParser for SargableQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(SargableQuery::IsNull()),
-            self.needs_recheck,
+            self.is_null_needs_recheck,
         ))
     }
 
@@ -774,6 +787,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // LABEL_LIST stores unnested items as bitmap keys. Nested items cannot be
+        // ordered by the bitmap lookup, so legacy indexes must fall back to a scan.
+        if validate_label_list_data_type(data_type).is_err() {
+            return None;
+        }
         // DataFusion normalizes array_contains to array_has
         if func.name() == "array_has" {
             let inner_type = match data_type {
@@ -796,34 +814,34 @@ impl ScalarQueryParser for LabelListQueryParser {
         }
 
         let label_list = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::List(list_arr) = label_list {
-            let list_values = list_arr.values();
-            if list_values.is_empty() {
-                return None;
-            }
-            let mut scalars = Vec::with_capacity(list_values.len());
-            for idx in 0..list_values.len() {
-                scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
-            }
-            if func.name() == "array_has_all" {
-                let query = LabelListQuery::HasAllLabels(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else if func.name() == "array_has_any" {
-                let query = LabelListQuery::HasAnyLabel(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
-            }
+        let list_values = match label_list {
+            ScalarValue::List(list_arr) => list_arr.values().clone(),
+            ScalarValue::LargeList(list_arr) => list_arr.values().clone(),
+            _ => return None,
+        };
+        if list_values.is_empty() {
+            return None;
+        }
+        let mut scalars = Vec::with_capacity(list_values.len());
+        for idx in 0..list_values.len() {
+            scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
+        }
+        if func.name() == "array_has_all" {
+            let query = LabelListQuery::HasAllLabels(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
+        } else if func.name() == "array_has_any" {
+            let query = LabelListQuery::HasAnyLabel(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
         } else {
             None
         }
@@ -838,6 +856,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -846,12 +868,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -908,7 +932,16 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -1804,12 +1837,9 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
                     search.exact_sargable_query_key()
                 }
                 _ => None,
@@ -1904,26 +1934,40 @@ impl ScalarIndexExpr {
     ///
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
-    #[async_recursion]
     pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
+        self.evaluate_with_options(index_loader, metrics, true)
+            .await
+    }
+
+    #[async_recursion]
+    async fn evaluate_with_options(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        track_nulls: bool,
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                // NOT needs the child's NULL rows to preserve SQL three-valued
+                // logic. Once enabled, keep tracking through the whole subtree.
+                let result = inner
+                    .evaluate_with_options(index_loader, metrics, true)
+                    .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1931,7 +1975,13 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        metrics,
+                    )
+                    .await?;
                 let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
@@ -1952,7 +2002,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_with_options(index_loader, metrics, false)
             .await?
             .drop_nulls())
     }
@@ -1991,27 +2041,30 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
     }
 }
 
-// Extract the full nested column path from a get_field expression chain
-// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+// Extract the full nested column path from chained or variadic get_field expressions.
+// For example, both get_field(get_field(metadata, "status"), "code") and
+// get_field(metadata, "status", "code") produce "metadata.status.code".
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
 
-    // Walk up the get_field chain
+    // Walk up the get_field chain. Add variadic arguments in reverse because all
+    // parts are reversed after reaching the base column.
     loop {
         match current_expr {
             Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
-                if udf.args.len() != 2 {
+                if udf.args.len() < 2 {
                     return None;
                 }
-                // Extract the field name from the second argument
-                // The Literal now has two fields: ScalarValue and Option<FieldMetadata>
-                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
-                    parts.push(field_name.clone());
-                } else {
-                    return None;
+
+                for field_expr in udf.args[1..].iter().rev() {
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = field_expr {
+                        parts.push(field_name.clone());
+                    } else {
+                        return None;
+                    }
                 }
-                // Move up to the parent expression
+
                 current_expr = &udf.args[0];
             }
             Expr::Column(col) => {
@@ -2037,7 +2090,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, '$.name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
@@ -2599,13 +2652,14 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::Array;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2614,6 +2668,10 @@ mod tests {
     struct ColInfo {
         data_type: DataType,
         parser: Box<MultiQueryParser>,
+    }
+
+    fn f16_scalar(value: f32) -> ScalarValue {
+        ScalarValue::Float16(Some(half::f16::from_f32(value)))
     }
 
     impl ColInfo {
@@ -2667,6 +2725,16 @@ mod tests {
             Field::new("price", DataType::Float32, false),
             Field::new("json", DataType::LargeBinary, false),
         ]);
+        check_with_schema(index_info, expr, expected, optimize, schema);
+    }
+
+    fn check_with_schema(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        expected: Option<IndexedExpression>,
+        optimize: bool,
+        schema: Schema,
+    ) {
         let df_schema: DFSchema = schema.try_into().unwrap();
 
         let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -2756,6 +2824,179 @@ mod tests {
         )
     }
 
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    fn test_label_list_query_parser(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, ['distributed'])",
+            Some(IndexedExpression::index_query(
+                "labels".to_string(),
+                "labels_idx".to_string(),
+                "LabelList".to_string(),
+                Arc::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some(
+                    "distributed".to_string(),
+                ))])),
+            )),
+            true,
+            schema,
+        );
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    fn test_label_list_nested_item(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        // Nested item types must not produce a scalar index query.
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, [[1]])",
+            None,
+            true,
+            schema,
+        );
+    }
+
+    #[test]
+    fn test_nested_column_index() {
+        let column = "user_profile.basic.age";
+        let index_info = MockIndexInfoProvider::new(vec![(
+            column,
+            ColInfo::new(
+                DataType::Int32,
+                Box::new(SargableQueryParser::new(
+                    format!("{column}_idx"),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new(
+            "user_profile",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "basic",
+                DataType::Struct(Fields::from(vec![Field::new("age", DataType::Int32, true)])),
+                true,
+            )])),
+            true,
+        )]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner
+            .parse_filter("user_profile.basic.age > 900")
+            .unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let expected = IndexedExpression::index_query(
+            column.to_string(),
+            format!("{column}_idx"),
+            "BTree".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(900))),
+                Bound::Unbounded,
+            )),
+        );
+
+        assert_eq!(plan.index_query, expected.scalar_query);
+        assert!(plan.refine_expr.is_none());
+    }
+
+    /// A `Float16` column must reach its scalar index like any other numeric
+    /// column. This is the second, quieter face of the coercion gap: `maybe_scalar`
+    /// runs `safe_coerce_scalar` on a literal the planner has *already* coerced,
+    /// so without a `ScalarValue::Float16` source arm the whole predicate silently
+    /// becomes a refine filter. The rows stay correct, which is why only the plan
+    /// catches it.
+    ///
+    /// This drives `Planner::parse_filter` rather than `check_with_schema` on
+    /// purpose. `check_with_schema` builds the expression with
+    /// `create_logical_expr`, which does no type coercion, so the literal would
+    /// still be `Float64` here and would exercise the `Float64` to `Float16`
+    /// target arm instead. Production coerces first, in `resolve_value`, and only
+    /// this order needs the source arm.
+    #[rstest]
+    #[case("temp = 1.0", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case(
+        "temp < 1.0",
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+    )]
+    #[case(
+        // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
+        // alone; at three or fewer over a bare column it becomes an `OR` chain and
+        // stops exercising `maybe_scalar_list`.
+        "temp IN (1.0, 2.5, 3.0, 4.0)",
+        SargableQuery::IsIn(vec![
+            f16_scalar(1.0),
+            f16_scalar(2.5),
+            f16_scalar(3.0),
+            f16_scalar(4.0),
+        ])
+    )]
+    fn test_float16_column_reaches_its_index(#[case] expr: &str, #[case] expected: SargableQuery) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "temp",
+            ColInfo::new(
+                DataType::Float16,
+                Box::new(SargableQueryParser::new(
+                    "temp_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("temp", DataType::Float16, true)]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter(expr).unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let wanted = IndexedExpression::index_query(
+            "temp".to_string(),
+            "temp_idx".to_string(),
+            "BTree".to_string(),
+            Arc::new(expected),
+        );
+
+        assert_eq!(plan.index_query, wanted.scalar_query, "predicate: {expr}");
+        assert!(plan.refine_expr.is_none(), "predicate: {expr}");
+    }
+
     #[test]
     fn test_expressions() {
         let index_info = MockIndexInfoProvider::new(vec![
@@ -2819,9 +3060,11 @@ mod tests {
             ),
         ]);
 
+        // The typed accessors decode the path value, matching the representation
+        // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, '$.name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
@@ -2830,6 +3073,14 @@ mod tests {
                 "$.name".to_string(),
             ),
         );
+        // `json_extract` evaluates to serialized JSON text, which does not match the
+        // decoded keys in the index, so it must not route.
+        // https://github.com/lance-format/lance/issues/8806
+        check_no_index(&index_info, "json_extract(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, '$.name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, '$.name') < 'foo'");
+        // A typed accessor on a path the index was not built for still declines.
+        check_no_index(&index_info, "json_get_string(json, '$.other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -4021,7 +4272,7 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, '$.b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4040,13 +4291,13 @@ mod tests {
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, '$.a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, '$.c') = 'foo'");
     }
 
     #[test]
@@ -4765,6 +5016,44 @@ mod tests {
     }
 
     #[test]
+    fn test_optimize_parser_merges_ranges_for_multiple_columns() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves =
+            optimize_parsed_scalar_filter("x > 10 AND x < 20 AND y > 30 AND y < 40", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                                Bound::Excluded(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(30))),
+                                Bound::Excluded(ScalarValue::Int64(Some(40))),
+                            ))
+                        )
+            )
+        }));
+    }
+
+    #[test]
     fn test_optimize_parser_preserves_standalone_null_checks() {
         let index_info = int64_index_info("BTree", false);
 
@@ -4831,6 +5120,25 @@ mod tests {
                 if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
                     if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
                         if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
         ));
     }
 

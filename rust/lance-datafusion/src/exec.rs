@@ -58,8 +58,9 @@ use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
-        MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC,
+        INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, MetricsExt,
+        PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -345,6 +346,7 @@ impl LanceExecutionOptions {
         if !self.use_spilling {
             return false;
         }
+        // Presence enables the bypass; the value is not parsed as a boolean.
         std::env::var("LANCE_BYPASS_SPILLING")
             .map(|_| {
                 info!("Bypassing spilling because LANCE_BYPASS_SPILLING is set");
@@ -361,10 +363,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
-        // The default 10MB sort spill reservation seems to be too small for many common cases.
-        //
-        // There currently is no reasonable guidance provided by DataFusion for setting this value.
-        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
+        // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
+        // to leave room for input batches in small pools. This reservation comes
+        // out of the same pool; it does not guarantee that every batch will fit.
         let sort_spill_reservation_bytes =
             (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
         session_config =
@@ -378,6 +380,8 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
                 NonZero::try_from(16).unwrap(),
             )));
     }
+    // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
+    // reservations. This bypasses the configured pool limit, not actual RAM limits.
     let runtime_env = runtime_env_builder.build_arc().unwrap();
 
     let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
@@ -490,10 +494,86 @@ pub struct ExecutionSummaryCounts {
     pub index_comparisons: usize,
     /// Additional metrics for more detailed statistics.  These are subject to change in the future
     /// and should only be used for debugging purposes.
+    ///
+    /// Newer metrics (e.g. [`INDEX_CACHE_HITS_METRIC`], [`INDEX_CACHE_MISSES_METRIC`]) are added
+    /// here rather than as `pub` fields, so this struct stays backwards compatible for callers
+    /// that construct or destructure it. Prefer the typed accessors below.
     pub all_counts: HashMap<String, usize>,
     /// Additional time metrics for more detailed statistics, stored in nanoseconds.
     /// These are subject to change in the future and should only be used for debugging purposes.
     pub all_times: HashMap<String, usize>,
+}
+
+impl ExecutionSummaryCounts {
+    /// Number of index cache page lookups where the loader was not executed
+    /// (per-page granularity).
+    ///
+    /// A "hit" is any page-level lookup at an instrumented cache boundary that
+    /// did not run the loader on this call. That covers both a true cache hit
+    /// on an already-populated entry and a coalesced concurrent load where an
+    /// in-flight loader started by a different caller produced the value.
+    ///
+    /// Instrumented boundaries in this release:
+    /// BTree page, IVF partition (v2, `write_cache=true` scan path), inverted
+    /// posting list (grouped and per-token), inverted per-token metadata
+    /// (`PostingMetadataKey`), inverted phrase positions (`PositionKey`),
+    /// bitmap posting (Equals / Range / IsIn), ngram posting, and rtree page
+    /// / null slot.
+    ///
+    /// Caveats:
+    /// * IVF v2 streaming scans and legacy v1 IVF partitions run
+    ///   `load_partition` with `write_cache=false`. Those loads always execute
+    ///   the loader and never write the result back, so they are reported as a
+    ///   miss on every call. See [`Self::index_cache_hit_ratio`].
+    /// * A cold posting-list lookup on the grouped inverted layout can record
+    ///   up to two misses (posting-list group + per-token metadata) for a
+    ///   single term.
+    ///
+    /// Other index cache boundaries such as HNSW graph pages and quantizer
+    /// codebooks are not yet instrumented; a scan that only touches those
+    /// paths returns `0` here.
+    pub fn index_cache_hits(&self) -> usize {
+        self.all_counts
+            .get(INDEX_CACHE_HITS_METRIC)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Number of index cache page lookups that had to execute the loader
+    /// (per-page granularity).
+    ///
+    /// A "miss" is any page-level lookup at an instrumented cache boundary
+    /// where the loader ran, i.e. the page was not resident and had to be
+    /// materialised (typically from storage). See
+    /// [`Self::index_cache_hits`] for the paired counter and the list of
+    /// instrumented boundaries.
+    pub fn index_cache_misses(&self) -> usize {
+        self.all_counts
+            .get(INDEX_CACHE_MISSES_METRIC)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Ratio of index cache hits to total lookups. Returns `0.0` when no lookups
+    /// were recorded in this scan.
+    ///
+    /// This ratio only reflects paths that write their result back to the
+    /// index cache. Streaming scans (IVF v2 `write_cache=false` and legacy v1
+    /// IVF `load_partition_stream`) intentionally bypass the cache and are
+    /// counted as misses on every call, so a workload dominated by streaming
+    /// vector scans will report a hit ratio near `0.0` regardless of cache
+    /// size.
+    pub fn index_cache_hit_ratio(&self) -> f32 {
+        // Widen to u128 before summing so a pathological (hits + misses)
+        // overflow can't panic in debug builds nor wrap in release builds.
+        let hits = self.index_cache_hits() as u128;
+        let total = hits + self.index_cache_misses() as u128;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f32 / total as f32
+        }
+    }
 }
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
@@ -556,6 +636,8 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
             indices_loaded = counts.indices_loaded,
             parts_loaded = counts.parts_loaded,
             index_comparisons = counts.index_comparisons,
+            index_cache_hits = counts.index_cache_hits(),
+            index_cache_misses = counts.index_cache_misses(),
         );
     }
     if let Some(callback) = options.execution_stats_callback.as_ref() {
@@ -644,6 +726,22 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
+    analyze_plan_with_context(plan, options, None).await
+}
+
+/// Analyze a plan, optionally under a caller-provided [`TaskContext`].
+///
+/// When `task_context` is `Some`, the plan executes under it instead of the
+/// context derived from `options`. Callers whose nodes read session-config
+/// extensions at execution time (e.g. distributed routing identity) must pass
+/// the context carrying those extensions; otherwise the nodes error during
+/// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
+/// of surfacing the error.
+pub async fn analyze_plan_with_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    task_context: Option<Arc<TaskContext>>,
+) -> Result<String> {
     // This is needed as AnalyzeExec launches a thread task per
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
@@ -660,9 +758,10 @@ pub async fn analyze_plan(
     ));
 
     let session_ctx = get_session_context(&options);
+    let task_context = task_context.unwrap_or_else(|| get_task_context(&session_ctx, &options));
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
-        .execute(0, get_task_context(&session_ctx, &options))
+        .execute(0, task_context)
         .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
@@ -1008,13 +1107,15 @@ impl ExecutionPlan for StrictBatchSizeExec {
 ///
 /// # Why this exists
 ///
-/// DataFusion's sort operator cannot handle batches larger than the memory
-/// pool size.  When upstream operators produce very large batches this can
-/// cause the sort to fail.  This node caps batch sizes
-/// *before* the sort so the operation succeeds.  The trade-off is a
-/// potentially expensive deep copy of the batch data — see below — but that
-/// is preferable to failing the operation entirely.  This workaround may
-/// become unnecessary if a fix is upstreamed to DataFusion.
+/// DataFusion's sort operator must reserve memory for an entire input batch,
+/// including estimated sort/merge overhead. It can spill buffered batches and
+/// retry, but still fails if the new batch's reservation cannot fit. This is
+/// separate from the historical allocation issues fixed by DataFusion PR #14644
+/// (<https://github.com/apache/datafusion/pull/14644>).
+///
+/// This node bounds input batch sizes before sorting, at the cost of potentially
+/// expensive deep copies. It does not guarantee success for every memory pool:
+/// spill/merge reservations and other consumers also need room in the pool.
 ///
 /// # Deep copy
 ///
@@ -1263,5 +1364,140 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+    }
+
+    /// A marker a node reads from the session-config extensions at execute time.
+    #[derive(Debug)]
+    struct RequiredExtension;
+
+    /// Execution node that only succeeds when [`RequiredExtension`] is present
+    /// on the task context's session config. This mirrors distributed routing
+    /// nodes that read a session-config identity extension during `execute`.
+    #[derive(Debug)]
+    struct NeedsExtensionExec {
+        properties: Arc<PlanProperties>,
+        /// Set once the node reaches execution with the extension present.
+        /// Observed by the test so that dropping context forwarding (which
+        /// makes `execute` error before this point) is detectable.
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl NeedsExtensionExec {
+        fn new(executed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            let schema = Arc::new(ArrowSchema::empty());
+            Self {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+                executed,
+            }
+        }
+    }
+
+    impl DisplayAs for NeedsExtensionExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+            write!(f, "NeedsExtensionExec")
+        }
+    }
+
+    impl ExecutionPlan for NeedsExtensionExec {
+        fn name(&self) -> &str {
+            "NeedsExtensionExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            context: Arc<TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            if context
+                .session_config()
+                .get_extension::<RequiredExtension>()
+                .is_none()
+            {
+                return Err(DataFusionError::Execution(
+                    "missing required session-config extension".to_string(),
+                ));
+            }
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let schema = self.schema();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::empty(),
+            )))
+        }
+    }
+
+    // Regression: analyze must run under a caller-provided TaskContext so nodes
+    // that read a session-config extension at execute time see it. Without the
+    // context the node errors and AnalyzeExec would otherwise report an empty,
+    // unexecuted plan tree.
+    #[tokio::test]
+    async fn test_analyze_plan_uses_provided_task_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
+
+        // Default context lacks the extension: the node errors during execute
+        // (never reaching the `executed` flag), but AnalyzeExec absorbs that
+        // per-partition failure and reports an empty, unexecuted plan tree
+        // rather than propagating the error. This is the regression symptom.
+        let report = analyze_plan(plan.clone(), LanceExecutionOptions::default())
+            .await
+            .expect("AnalyzeExec swallows the node's execute error into an Ok report");
+        assert!(
+            report.contains("NeedsExtensionExec, metrics=[]"),
+            "expected an empty, unexecuted NeedsExtensionExec node, got: {report}"
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "node must not execute successfully without the extension"
+        );
+
+        // A context carrying the extension executes the node successfully.
+        let options = LanceExecutionOptions::default();
+        let session_ctx = get_session_context(&options);
+        let config = session_ctx
+            .task_ctx()
+            .session_config()
+            .clone()
+            .with_extension(Arc::new(RequiredExtension));
+        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::new(
+            task_ctx.task_id(),
+            task_ctx.session_id(),
+            config,
+            task_ctx.scalar_functions().clone(),
+            task_ctx.higher_order_functions().clone(),
+            task_ctx.aggregate_functions().clone(),
+            task_ctx.window_functions().clone(),
+            task_ctx.runtime_env(),
+        ));
+        let report = analyze_plan_with_context(plan, options, Some(task_ctx))
+            .await
+            .expect("analyze should succeed when the extension is present");
+        assert!(report.contains("NeedsExtensionExec"));
+        // The node only reaches this flag when the supplied context is actually
+        // forwarded to `execute`; dropping the forwarding fails this assertion.
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "supplied context must be forwarded so the node executes"
+        );
     }
 }
